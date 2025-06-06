@@ -1,0 +1,25 @@
+# --- Fichiers de données et résultats ---
+# Ignorer tous les fichiers CSV et Excel
+*.csv
+*.xlsx
+
+# --- Fichiers spécifiques à Python ---
+# Dossiers de cache Python
+__pycache__/
+*.pyc
+
+# Environnements virtuels
+venv/
+env/
+.venv/
+*.env
+
+# --- Fichiers spécifiques aux éditeurs et IDE ---
+.vscode/
+.idea/
+
+# --- Fichiers spécifiques à macOS ---
+.DS_Store
+
+# --- Fichiers de configuration locaux ---
+.env
