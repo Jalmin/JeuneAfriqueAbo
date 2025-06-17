@@ -37,9 +37,19 @@ def load_retention_data():
         
         for segment_name in segment_names:
             try:
-                segments_data[segment_name] = pd.read_excel(DATA_FILE, sheet_name=segment_name)
-            except:
-                print(f"Onglet {segment_name} non trouvé, ignoré.")
+                segment_df = pd.read_excel(DATA_FILE, sheet_name=segment_name)
+                segments_data[segment_name] = segment_df
+                print(f"✓ {segment_name}: {len(segment_df)} lignes, colonnes: {list(segment_df.columns)}")
+                
+                # Afficher les valeurs uniques de segment_value
+                if 'segment_value' in segment_df.columns:
+                    unique_values = segment_df['segment_value'].unique()
+                    print(f"  Valeurs uniques: {unique_values}")
+                else:
+                    print(f"  ⚠️ Colonne 'segment_value' manquante!")
+                    
+            except Exception as e:
+                print(f"⚠️ Onglet {segment_name} non trouvé: {e}")
         
         print(f"✓ Données chargées: {len(retention_global)} lignes de rétention globale")
         print(f"✓ {len(resume_cohortes)} cohortes analysées")
@@ -83,19 +93,236 @@ def prepare_retention_chart_data(retention_df, selected_cohort='all'):
     
     return chart_data
 
-def prepare_segment_evolution_data(segments_data, segment_type):
+def prepare_segment_evolution_data(segments_data, segment_type, cohort_filter='all'):
+    """Prépare les données pour l'évolution de la rétention par segment avec filtre de cohorte"""
+    print(f"\n=== DIAGNOSTIC {segment_type} (Filtre: {cohort_filter}) ===")
+    
+    if segment_type not in segments_data:
+        print(f"❌ Segment {segment_type} non trouvé")
+        return [], []
+    
+    segment_df = segments_data[segment_type].copy()
+    print(f"✓ Données initiales: {len(segment_df)} lignes")
+    
+    # ÉTAPE 1: FILTRER LES COHORTES D'ABORD
+    if cohort_filter != 'all':
+        try:
+            if 'cohorte' in segment_df.columns:
+                segment_df['cohorte_date'] = pd.to_datetime(segment_df['cohorte'], format='%m/%Y')
+                
+                # Définir la date limite selon le filtre
+                if cohort_filter == '2023-12':
+                    cutoff_date = pd.to_datetime('2023-12-01')
+                    max_months = 25  # On peut voir jusqu'à M25 avec ces cohortes
+                elif cohort_filter == '2023-06':
+                    cutoff_date = pd.to_datetime('2023-06-01')
+                    max_months = 25
+                elif cohort_filter == '2022-12':
+                    cutoff_date = pd.to_datetime('2022-12-01')
+                    max_months = 25
+                elif cohort_filter == '2022-06':
+                    cutoff_date = pd.to_datetime('2022-06-01')
+                    max_months = 25
+                else:
+                    cutoff_date = pd.to_datetime('2099-12-01')
+                    max_months = 25
+                
+                # FILTRER UNIQUEMENT LES COHORTES (pas les mois)
+                cohortes_avant = segment_df['cohorte'].nunique()
+                segment_df = segment_df[segment_df['cohorte_date'] <= cutoff_date]
+                cohortes_apres = segment_df['cohorte'].nunique()
+                
+                print(f"✓ Cohortes filtrées: {cohortes_avant} → {cohortes_apres} cohortes")
+                print(f"✓ Données après filtrage cohorte: {len(segment_df)} lignes")
+                
+                # Afficher les cohortes retenues
+                cohortes_retenues = sorted(segment_df['cohorte'].unique())
+                print(f"✓ Cohortes retenues: {cohortes_retenues[:5]}...{cohortes_retenues[-3:] if len(cohortes_retenues) > 8 else ''}")
+            else:
+                print("⚠️ Colonne 'cohorte' non trouvée, pas de filtrage possible")
+                max_months = 25
+        except Exception as e:
+            print(f"⚠️ Erreur lors du filtrage: {e}")
+            max_months = 25
+    else:
+        max_months = 25
+    
+    # ÉTAPE 2: NETTOYER LES DONNÉES
+    required_cols = ['segment_value', 'mois_relatif', 'clients_initiaux', 'clients_actifs']
+    for col in required_cols:
+        if col not in segment_df.columns:
+            print(f"❌ Colonne '{col}' manquante!")
+            return [], []
+    
+    segment_df = segment_df[segment_df['clients_initiaux'] > 0]
+    segment_df = segment_df[segment_df['clients_actifs'] >= 0]
+    segment_df = segment_df[segment_df['mois_relatif'] <= max_months]
+    
+    print(f"✓ Données nettoyées: {len(segment_df)} lignes valides")
+    
+    # ÉTAPE 3: RECALCULER LES TOTAUX PAR SEGMENT AVEC LES COHORTES FILTRÉES
+    print(f"\n--- RECALCUL DES TOTAUX AVEC COHORTES FILTRÉES ---")
+    
+    # Identifier les segments principaux par taille (APRÈS filtrage)
+    segment_sizes = segment_df[segment_df['mois_relatif'] == 0].groupby('segment_value')['clients_initiaux'].sum()
+    main_segments = segment_sizes.nlargest(3).index.tolist()
+    
+    print(f"✓ Top 3 segments (après filtrage): {main_segments}")
+    for seg in main_segments:
+        size = segment_sizes[seg]
+        print(f"  - {seg}: {size:,} clients")
+    
+    if not main_segments:
+        return [], []
+    
+    # ÉTAPE 4: CALCULER L'ÉVOLUTION POUR CHAQUE MOIS
+    evolution_data = []
+    months = list(range(0, max_months + 1))
+    
+    for month in months:
+        month_data = {'mois_relatif': month}
+        
+        for segment_value in main_segments:
+            # 1. TOTAL clients initiaux pour ce segment (M0, toutes cohortes filtrées)
+            initial_data = segment_df[
+                (segment_df['segment_value'] == segment_value) & 
+                (segment_df['mois_relatif'] == 0)
+            ]
+            
+            if initial_data.empty:
+                month_data[str(segment_value)] = None
+                continue
+                
+            total_initial = initial_data['clients_initiaux'].sum()
+            
+            # 2. TOTAL clients actifs pour ce segment à ce mois (toutes cohortes filtrées)
+            month_data_seg = segment_df[
+                (segment_df['segment_value'] == segment_value) & 
+                (segment_df['mois_relatif'] == month)
+            ]
+            
+            if month_data_seg.empty:
+                month_data[str(segment_value)] = None
+                continue
+            
+            total_active = month_data_seg['clients_actifs'].sum()
+            
+            # 3. Calculer la rétention sur le nouveau bassin
+            if total_initial > 0:
+                retention_rate = (total_active / total_initial) * 100
+                retention_rate = min(retention_rate, 100.0)
+                
+                if month == 0:
+                    retention_rate = 100.0
+                
+                month_data[str(segment_value)] = round(retention_rate, 1)
+                
+                # Debug pour certains mois
+                if month in [0, 6, 12, 18, 24] and month <= max_months:
+                    print(f"  {segment_value} M{month}: {total_active:,}/{total_initial:,} = {retention_rate:.1f}%")
+            else:
+                month_data[str(segment_value)] = None
+        
+        evolution_data.append(month_data)
+    
+    # ÉTAPE 5: VALIDATION FINALE (lissage optionnel)
+    for segment in main_segments:
+        values = []
+        
+        for item in evolution_data:
+            val = item.get(str(segment))
+            if val is not None:
+                values.append(val)
+        
+        if len(values) > 1:
+            print(f"✓ {segment}: {len(values)} points, range {min(values):.1f}%-{max(values):.1f}%")
+    
+    return evolution_data, main_segments
+
+def create_segment_evolution_chart(evolution_data, main_segments, segment_type):
+    """Crée le graphique d'évolution de la rétention par segment"""
+    if not evolution_data or not main_segments:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Pas assez de données valides",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, xanchor='center', yanchor='middle',
+            showarrow=False, font=dict(size=16, color="gray")
+        )
+        fig.update_layout(title="Données insuffisantes", template='plotly_white', height=400)
+        return fig
+    
+    fig = go.Figure()
+    colors = ['#3B82F6', '#10B981', '#F59E0B']  # Bleu, Vert, Orange
+    
+    for i, segment in enumerate(main_segments):
+        x_values = []
+        y_values = []
+        
+        # Collecter les points valides
+        for item in evolution_data:
+            value = item.get(str(segment))
+            if value is not None and 0 <= value <= 100:
+                x_values.append(item['mois_relatif'])
+                y_values.append(value)
+        
+        if len(x_values) >= 3:  # Minimum 3 points pour une courbe
+            fig.add_trace(go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode='lines+markers',
+                name=f'{segment.title()} ({len(x_values)} mois)',
+                line=dict(color=colors[i % len(colors)], width=3),
+                marker=dict(size=5),
+                connectgaps=False
+            ))
+    
+    fig.update_layout(
+        title=f'Rétention par {segment_type.replace("Retention_", "").replace("_", " ").title()}',
+        xaxis_title='Mois depuis l\'abonnement',
+        yaxis_title='Taux de rétention (%)',
+        yaxis=dict(range=[0, 105], ticksuffix='%'),
+        xaxis=dict(range=[0, 25]),
+        template='plotly_white',
+        height=400,
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=0.95,
+            xanchor="left",
+            x=1.02
+        ),
+        margin=dict(r=120)
+    )
+    
+    # Ajouter des lignes de référence
+    fig.add_hline(y=50, line_dash="dash", line_color="red", opacity=0.3, 
+                  annotation_text="50% rétention")
+    fig.add_hline(y=100, line_dash="dot", line_color="green", opacity=0.3,
+                  annotation_text="Départ (100%)")
+    
+    return fig
     """Prépare les données pour l'évolution de la rétention par segment"""
     if segment_type not in segments_data:
-        return []
+        print(f"Segment {segment_type} non trouvé dans les données")
+        return [], []
     
     segment_df = segments_data[segment_type]
+    print(f"Traitement du segment {segment_type} avec {len(segment_df)} lignes")
     
     # Identifier les segments principaux (avec suffisamment de données)
     segment_sizes = segment_df.groupby('segment_value')['clients_initiaux'].sum()
-    main_segments = segment_sizes[segment_sizes >= 50].index.tolist()[:5]  # Top 5 segments
+    print(f"Tailles des segments: {segment_sizes.to_dict()}")
+    
+    # Prendre tous les segments avec au moins 20 clients
+    main_segments = segment_sizes[segment_sizes >= 20].index.tolist()
+    print(f"Segments principaux retenus: {main_segments}")
+    
+    if not main_segments:
+        return [], []
     
     evolution_data = []
-    months = list(range(0, 25))  # 0 à 24 mois
+    months = list(range(0, 26))  # 0 à 25 mois
     
     for month in months:
         month_data = {'mois_relatif': month}
@@ -107,13 +334,16 @@ def prepare_segment_evolution_data(segments_data, segment_type):
             ]
             
             if not segment_month_data.empty:
-                avg_retention = segment_month_data['taux_retention'].mean()
-                month_data[str(segment_value)] = round(avg_retention, 2)
+                # Moyenne pondérée par le nombre de clients
+                total_clients = segment_month_data['clients_initiaux'].sum()
+                weighted_retention = (segment_month_data['taux_retention'] * segment_month_data['clients_initiaux']).sum() / total_clients if total_clients > 0 else 0
+                month_data[str(segment_value)] = round(weighted_retention, 2)
             else:
                 month_data[str(segment_value)] = None
         
         evolution_data.append(month_data)
     
+    print(f"Données d'évolution générées pour {len(evolution_data)} mois")
     return evolution_data, main_segments
 
 def prepare_segment_data(segments_data, segment_type):
@@ -286,23 +516,23 @@ else:
                                     value='all',
                                     className="mb-3"
                                 )
-                            ], width=4),
+                            ], width=3),
                             dbc.Col([
                                 html.Label("Segment:", className="fw-bold"),
                                 dcc.Dropdown(
                                     id='segment-dropdown',
                                     options=[
                                         {'label': 'Vue globale', 'value': 'global'},
-                                        {'label': 'Fréquence', 'value': 'Retention_Frequence'},
-                                        {'label': 'Source', 'value': 'Retention_Tm_source'},
-                                        {'label': 'Médium', 'value': 'Retention_Tm_medium'},
-                                        {'label': 'Moyen de paiement', 'value': 'Retention_Psp'},
-                                        {'label': 'Tranches de revenus', 'value': 'Retention_Revenue_tranche'}
+                                        {'label': '⏰ Fréquence (monthly/annual/weekly)', 'value': 'Retention_Frequence'},
+                                        {'label': '📍 Source (tm_source)', 'value': 'Retention_Tm_source'},
+                                        {'label': '🔗 Médium (tm_medium)', 'value': 'Retention_Tm_medium'},
+                                        {'label': '💳 Moyen de paiement (PSP)', 'value': 'Retention_Psp'},
+                                        {'label': '💰 Tranches de revenus', 'value': 'Retention_Revenue_tranche'}
                                     ],
-                                    value='global',
+                                    value='Retention_Frequence',
                                     className="mb-3"
                                 )
-                            ], width=4),
+                            ], width=3),
                             dbc.Col([
                                 html.Label("Type de vue:", className="fw-bold"),
                                 dcc.Dropdown(
@@ -314,7 +544,22 @@ else:
                                     value='comparison',
                                     className="mb-3"
                                 )
-                            ], width=4)
+                            ], width=3),
+                            dbc.Col([
+                                html.Label("Cohortes jusqu'à:", className="fw-bold"),
+                                dcc.Dropdown(
+                                    id='cohort-filter-dropdown',
+                                    options=[
+                                        {'label': '📅 Toutes les cohortes', 'value': 'all'},
+                                        {'label': '🔒 Jusqu\'à 12/2023 (12M+ data)', 'value': '2023-12'},
+                                        {'label': '🔒 Jusqu\'à 06/2023 (18M+ data)', 'value': '2023-06'},
+                                        {'label': '🔒 Jusqu\'à 12/2022 (24M+ data)', 'value': '2022-12'},
+                                        {'label': '🔒 Jusqu\'à 06/2022 (30M+ data)', 'value': '2022-06'}
+                                    ],
+                                    value='2023-06',  # Par défaut, cohortes avec au moins 18M de data
+                                    className="mb-3"
+                                )
+                            ], width=3)
                         ])
                     ])
                 ])
@@ -410,9 +655,12 @@ def update_retention_chart(selected_cohort):
 @app.callback(
     Output('segment-bar-chart', 'figure'),
     [Input('segment-dropdown', 'value'),
-     Input('view-type-dropdown', 'value')]
+     Input('view-type-dropdown', 'value'),
+     Input('cohort-filter-dropdown', 'value')]
 )
-def update_segment_chart(selected_segment, view_type):
+def update_segment_chart(selected_segment, view_type, cohort_filter):
+    print(f"Callback déclenché: segment={selected_segment}, view={view_type}, filter={cohort_filter}")
+    
     if selected_segment == 'global':
         # Graphique vide avec message
         fig = go.Figure()
@@ -429,14 +677,9 @@ def update_segment_chart(selected_segment, view_type):
         )
         return fig
     else:
-        if view_type == 'evolution':
-            # Vue évolution : courbes par segment
-            evolution_data, main_segments = prepare_segment_evolution_data(segments_data, selected_segment)
-            return create_segment_evolution_chart(evolution_data, main_segments, selected_segment)
-        else:
-            # Vue comparaison : barres par période
-            segment_data = prepare_segment_data(segments_data, selected_segment)
-            return create_segment_bar_chart(segment_data, selected_segment)
+        # Toujours afficher les courbes d'évolution avec le filtre
+        evolution_data, main_segments = prepare_segment_evolution_data(segments_data, selected_segment, cohort_filter)
+        return create_segment_evolution_chart(evolution_data, main_segments, selected_segment)
 
 @app.callback(
     Output('summary-table', 'children'),
